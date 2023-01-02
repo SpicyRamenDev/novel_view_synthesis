@@ -1,36 +1,29 @@
-from wisp.config_parser import parse_yaml_config
+import json
+import numpy as np
 
-import argparse
-import pprint
-
-def my_argparse_to_str(parser, args=None):
-    """Convert parser to string representation for Tensorboard logging.
-
-    Args:
-        parser (argparse.parser): Parser object. Needed for the argument groups.
-        args : The parsed arguments. Will compute from the parser if None.
-    
-    Returns:
-        args    : The parsed arguments.
-        arg_str : The string to be printed.
-    """
-    
-    if args is None:
-        args = parser.parse_args('')
-
-    if args.config is not None:
-        parse_yaml_config(args.config, parser)
-
-    args = parser.parse_args('')
-
-    args_dict = {}
-    for group in parser._action_groups:
-        group_dict = {a.dest: getattr(args, a.dest, None) for a in group._group_actions}
-        args_dict[group.title] = vars(argparse.Namespace(**group_dict))
-
-    pp = pprint.PrettyPrinter(indent=2)
-    args_str = pp.pformat(args_dict)
-    args_str = f'```{args_str}```'
-
-    return args, args_str
-
+def split_transforms(path, dest):
+    transforms_path = path / 'transforms.json.bak'
+    with open(transforms_path, 'r') as f:
+        transforms = json.load(f)
+    transforms['aabb_scale'] = 0.5
+    frames = transforms['frames']
+    p = np.array([
+        [1,  0,  0,  0],
+        [0,  0, -1,  0],
+        [0,  1,  0,  0],
+        [0,  0,  0,  1]
+    ])
+    for frame in frames:
+        m = frame['transform_matrix']
+        m = np.matmul(p, m).tolist()
+        frame['transform_matrix'] = m
+        frame['image_path'] = str(path / frame['image_path'])
+    with open(dest / 'transforms_train.json', 'w') as f:
+        transforms['frames'] = frames[:4]
+        json.dump(transforms, f, indent=4)
+    with open(dest / 'transforms_val.json', 'w') as f:
+        transforms['frames'] = frames[:16]
+        json.dump(transforms, f, indent=4)
+    with open(dest / 'transforms_test.json', 'w') as f:
+        transforms['frames'] = frames[:16]
+        json.dump(transforms, f, indent=4)

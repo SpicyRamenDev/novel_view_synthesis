@@ -19,7 +19,7 @@ dataset:
     multiview_dataset_format: 'standard'
     num_rays_sampled_per_img: 4096
     mip: 2
-    bg_color: 'white'
+    bg_color: 'noise'
 
 renderer:
     tracer_type: 'MyPackedRFTracer'
@@ -42,7 +42,7 @@ trainer:
     model_format: 'full'
     valid_every: 50
     save_every: 10
-    prune_every: 100 # iterations
+    prune_every: 10 # iterations
     render_tb_every: 10
 
 grid:
@@ -86,7 +86,7 @@ my_optimizer:
 my_diffusion:
     repo_id: 'stabilityai/stable-diffusion-2-1-base'
     diffusion_type: 'StableDiffusion'
-    prompt: 'a DSLR photo of a hamburger'
+    prompt: 'a 3D render of a birthday cake with candles'
     negative_prompt: ''
     guidance_scale: 100
 

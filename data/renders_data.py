@@ -56,7 +56,7 @@ class RenderCoupleDataset(Dataset):
         target_image = transforms.ToTensor()(target_image)
         if self.data_augmentations is not None:
             input_image, target_image = self.data_augmentations(input_image, target_image)
-        if self.transforms is not None:
+        if self.data_transforms is not None:
             input_image = self.data_transforms(input_image)
             target_image = self.data_transforms(target_image)
         return input_image, target_image
@@ -75,36 +75,48 @@ class RenderDataset(Dataset):
         image = transforms.ToTensor()(image)
         if self.data_augmentations is not None:
             image = self.data_augmentations(image)
-        if self.transforms is not None:
+        if self.data_transforms is not None:
             image = self.data_transforms(image)
         return image
     
-def makeDataLoader(data, config, dataset_class=RenderDataset, data_transforms=None, data_augmentations=None, test_size=0.1):
-    train_ids, valid_ids = train_test_split(data, test_size=test_size, random_state=config.seed)
-    train_dataset = dataset_class(data, data_transforms, data_augmentations)
-    valid_dataset = dataset_class(data, data_transforms)
+
+class LatentDataset(Dataset):
+    def __init__(self, data, data_transforms=None, data_augmentations=None):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        latent = torch.load(self.data[idx]['latent_path'])
+        return latent
+
+
+def split_dataset(config, data, test_size=0.1):
+    return train_test_split(data, test_size=test_size, random_state=config.seed)
+
+
+def makeDataLoader(data, config, batch_size, dataset_class=RenderDataset, data_transforms=None, data_augmentations=None, shuffle=True):
+    dataset = dataset_class(data, data_transforms, data_augmentations)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    size = len(dataset)
     
-    kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=config.train_batch_size, shuffle=True, **kwargs)
-    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=config.eval_batch_size, shuffle=False, **kwargs)
-    
-    train_size = len(train_dataset)
-    valid_size = len(valid_dataset)
-    
-    return train_loader, valid_loader, train_size, valid_size
+    return loader, size
+
 
 class BackgroundColor(object):
     def __init__(self, color):
-        self.color = color
+        self.color = torch.tensor(color)
 
     def __call__(self, image):
         rgb = image[:3]
         alpha = image[3]
-        bg_color = self.color.repeat(1, *image.shape[-2:])
+        bg_color = self.color.view(3, 1, 1).expand(3, *rgb.shape[-2:])
         blended_rgb = torch.mul(rgb, alpha) + torch.mul(bg_color, 1 - alpha)
         return blended_rgb
 
-class RandomHue(object):
+
+class RandomHueCouple(object):
     def __init__(self):
         pass
     
@@ -121,11 +133,25 @@ class RandomHue(object):
         target = self.adjust_hue(target, hue)
         return data, target
 
+
+class RandomHue(object):
+    def __init__(self):
+        self.transforms = transforms.ColorJitter(hue=0.5)
+    
+    def __call__(self, image):
+        rgb = image[:3]
+        alpha = image[3:]
+        rgb = self.transforms(rgb)
+        image = torch.cat([rgb, alpha], 0)
+        return image
+    
+
 NormTorchToPil = transforms.Compose([
     transforms.Normalize(mean = [ 0., 0., 0. ],
                          std = [ 1/0.5 ]),
     transforms.Normalize(mean = [ -0.5 ],
                          std = [ 1., 1., 1. ]),
+    transforms.Lambda(lambda x: torch.clamp(x, 0, 1)),
     transforms.ToPILImage(),
 ])
 
