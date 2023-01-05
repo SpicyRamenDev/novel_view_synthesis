@@ -56,7 +56,7 @@ class MyPackedRFTracer(BaseTracer):
         Returns:
             (set): Set of channel strings.
         """
-        return {"depth", "hit", "rgb", "alpha", "bg", "opacity_sum", "entropy"}
+        return {"depth", "hit", "rgb", "alpha", "entropy"}
 
     def get_required_nef_channels(self):
         """Returns the channels required by neural fields to be compatible with this tracer.
@@ -68,7 +68,7 @@ class MyPackedRFTracer(BaseTracer):
 
     def trace(self, nef, channels, extra_channels, rays,
               lod_idx=None, raymarch_type='voxel', num_steps=64, step_size=1.0, bg_color='white',
-              stop_grad_channels=[], entropy_threshold=0.01, **kwargs):
+              stop_grad_channels=[], entropy_threshold=0.01, diffusion_bg_color='', **kwargs):
         """Trace the rays against the neural field.
 
         Args:
@@ -100,14 +100,15 @@ class MyPackedRFTracer(BaseTracer):
         else:
             depth = None
 
+        if diffusion_bg_color != '':
+            bg_color = diffusion_bg_color
         if bg_color == 'white':
-            bg = torch.ones(N, 3, device=rays.origins.device)
+            rgb = torch.ones(N, 3, device=rays.origins.device)
         elif bg_color == 'noise':
-            bg = torch.random() * torch.ones(N, 3, device=rays.origins.device)
+            rand_bg_color = torch.rand(3, device=rays.origins.device)
+            rgb = rand_bg_color * torch.ones(N, 3, device=rays.origins.device)
         else:
-            bg = torch.zeros(N, 3, device=rays.origins.device)
-        bg.requires_grad = False
-        rgb = bg.clone().detach()
+            rgb = torch.zeros(N, 3, device=rays.origins.device)
         hit = torch.zeros(N, device=rays.origins.device, dtype=torch.bool)
         out_alpha = torch.zeros(N, 1, device=rays.origins.device)
 
@@ -153,7 +154,7 @@ class MyPackedRFTracer(BaseTracer):
         if bg_color == 'white':
             color = torch.clamp((1.0 - alpha) + ray_colors, max=1.0)
         elif bg_color == 'noise':
-            color = (1.0 - alpha) * bg + alpha * ray_colors
+            color = (1.0 - alpha) * rand_bg_color + alpha * ray_colors
         else:
             color = alpha * ray_colors
         rgb[ridx_hit] = color
@@ -177,18 +178,14 @@ class MyPackedRFTracer(BaseTracer):
             extra_outputs[channel] = out_feats
 
         opacity = 1 - torch.exp(-tau)
-
         opacity_sum = spc_render.sum_reduce(opacity, boundary)
-        out_opacity_sum = torch.zeros(N, 1, device=opacity_sum.device)
-        out_opacity_sum[ridx_hit] = opacity_sum
-
         opacity_xlogx_sum = spc_render.sum_reduce(opacity * torch.log(opacity + 1e-10), boundary)
         entropy_ray = -opacity_xlogx_sum / (opacity_sum + 1e-10) + torch.log(opacity_sum + 1e-10)
-        mask = (opacity_sum > 1e-6).detach()
+        mask = (opacity_sum > 0.01).detach()
         entropy_ray *= mask
         out_entropy = torch.zeros(N, 1, device=entropy_ray.device)
         out_entropy[ridx_hit] = entropy_ray
 
-        return RenderBuffer(depth=depth, hit=hit, rgb=rgb, alpha=out_alpha, bg=bg,
-                            opacity_sum=out_opacity_sum, entropy=out_entropy,
+        return RenderBuffer(depth=depth, hit=hit, rgb=rgb, alpha=out_alpha,
+                            entropy=out_entropy,
                             **extra_outputs)

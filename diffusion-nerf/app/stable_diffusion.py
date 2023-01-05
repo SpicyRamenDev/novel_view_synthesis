@@ -18,10 +18,11 @@ class StableDiffusion(Diffusion):
 
         self.transform = transforms.Compose([
             transforms.Resize((512, 512)),
+            # transforms.Pad((512 - 64) // 2),
             transforms.Normalize([0.5], [0.5]),
             ])
 
     def process_image(self, image):
         posterior = self.vae.encode(image).latent_dist
-        latent = posterior.sample() * 0.18215
+        latent = posterior.mean * 0.18215
         return latent

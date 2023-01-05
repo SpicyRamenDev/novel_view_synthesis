@@ -31,6 +31,7 @@ from kaolin.render.camera import Camera
 from wisp.ops.raygen.raygen import generate_centered_pixel_coords, generate_pinhole_rays
 
 from utils import spherical_to_cartesian, l2_normalize
+import math
 
 
 class DataLoaderGenerator(object):
@@ -88,11 +89,25 @@ class MyTrainerSD(BaseTrainer):
         self.num_novel_views_per_gt = self.extra_args["num_novel_views_per_gt"]
         self.num_novel_views_base = self.extra_args["num_novel_views_base"]
         self.bg_color = self.extra_args["bg_color"] if self.extra_args["bg_color"] != 'noise' else 'black'
+        self.warmup_iterations = self.extra_args["warmup_iterations"]
+        self.init_lr = self.extra_args["init_lr"]
+        self.end_lr = self.extra_args["end_lr"]
+        self.reg_warmup_iterations = self.extra_args["reg_warmup_iterations"]
+        self.reg_init_lr = self.extra_args["reg_init_lr"]
         # immutable
         self.ray_grid = generate_centered_pixel_coords(self.diffusion_resolution, self.diffusion_resolution,
                                                        self.diffusion_resolution, self.diffusion_resolution, device='cuda')
         if self.diffusion is not None:
             self.init_text_embeddings()
+
+        def scheduler_function(epoch):
+            iteration = epoch * self.iterations_per_epoch
+            if iteration < self.warmup_iterations:
+                return self.init_lr + (1 - self.init_lr) * iteration / self.warmup_iterations
+            else:
+                t = (iteration - self.warmup_iterations) / (self.max_iterations - self.warmup_iterations)
+                return self.end_lr + 0.5 * (1 - self.end_lr) * (1 + math.cos(t * math.pi))
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, scheduler_function)
 
     def init_text_embeddings(self):
         if self.dataset is not None and self.num_novel_views_per_gt == 0:
@@ -101,26 +116,33 @@ class MyTrainerSD(BaseTrainer):
 
         prompt, negative_prompt = self.extra_args["prompt"], self.extra_args["negative_prompt"]
 
-        view_prompts = ['', 'overhead view', 'front view', 'side view', 'back view']
+        view_prompts = {
+            '': ('', ''),
+            'overhead': ('overhead view', ''),
+            'front': ('front view', 'back view'),
+            'side': ('side view', ''),
+            'back': ('back view', 'front view')
+        }
         self.text_embeddings = dict()
-        for view_prompt in view_prompts:
-            cond_prompt = prompt if view_prompt == '' else prompt + ', ' + view_prompt
-            text_embedding = self.diffusion.get_text_embedding(cond_prompt, negative_prompt)
-            self.text_embeddings[view_prompt] = text_embedding
+        for view, (positive, negative) in view_prompts.items():
+            positive_cond = prompt if positive == '' else prompt + ', ' + positive
+            negative_cond = negative_prompt  # if negative == '' else negative_prompt + ', ' + negative
+            text_embedding = self.diffusion.get_text_embedding(positive_cond, negative_cond)
+            self.text_embeddings[view] = text_embedding
 
     def get_text_embeddings(self, azimuth, elevation):
         if not self.extra_args["use_view_prompt"]:
             return self.text_embeddings['']
         if elevation > 60:
-            view_prompt = 'overhead view'
-        elif 45 < azimuth < 135:
-            view_prompt = 'side view'
-        elif azimuth < 225:
-            view_prompt = 'back view'
-        elif azimuth < 315:
-            view_prompt = 'side view'
+            view_prompt = 'overhead'
+        elif 0 <= azimuth < 60:
+            view_prompt = 'front'
+        elif 60 <= azimuth < 180:
+            view_prompt = 'side'
+        elif 180 <= azimuth < 240:
+            view_prompt = 'back'
         else:
-            view_prompt = 'front view'
+            view_prompt = 'side'
 
         return self.text_embeddings[view_prompt]
 
@@ -158,8 +180,7 @@ class MyTrainerSD(BaseTrainer):
     def prepare_step_gt(self, data):
         rays = data['rays'].to(self.device).squeeze(0)
         img_gts = data['imgs'].to(self.device).squeeze(0)
-        mask_gts = data['masks'].to(self.device).squeeze(0)
-        return rays, img_gts, mask_gts
+        return rays, img_gts
 
     def prepare_step_novel(self):
         azimuth = torch.rand(1) * (self.azimuth_range[1] - self.azimuth_range[0]) + self.azimuth_range[0]
@@ -171,41 +192,52 @@ class MyTrainerSD(BaseTrainer):
         camera_up = torch.tensor([0., 1., 0.]) + torch.randn(3) * self.camera_up_std
         look_at = torch.randn(3) * self.look_at_std
 
+        if self.epoch > self.max_epochs * 0.7:
+            camera_angle *= 0.8
+            camera_distance *= 1
+            focal_length_multiplier *= 1.2
+        if self.total_iterations < 1000:
+            focal_length_multiplier = 1.0
+
         camera_coords = spherical_to_cartesian(azimuth * torch.pi / 180, elevation * torch.pi / 180, camera_distance)
-        camera_coords += camera_offset
+        #camera_coords += camera_offset
         camera_coords = camera_coords
         fov = camera_angle * torch.pi / 180
-        focal_length = self.diffusion_resolution * focal_length_multiplier
+        focal_length = 0.5 * self.diffusion_resolution * (camera_distance - 0.3) * focal_length_multiplier
+        # focal_length = self.diffusion_resolution * focal_length_multiplier
         camera = Camera.from_args(
             eye=camera_coords,
             at=look_at,
             up=camera_up,
-            fov=fov,
-            #focal_x=focal_length,
+            # fov=fov,
+            focal_x=focal_length,
             width=self.diffusion_resolution, height=self.diffusion_resolution,
-            near=camera_distance-1, # 1e-2,
-            far=camera_distance+1, # 6.0,
+            near=max(camera_distance-2, 0.0), # 1e-2,
+            far=camera_distance+2, # 6.0,
             dtype=torch.float32,
             device='cuda'
         )
         rays = self.sample_all_rays(camera)
         rays = rays.reshape(self.diffusion_resolution ** 2, -1)
 
-        light_direction = l2_normalize(l2_normalize(camera_coords) + torch.randn(3))
+        # light_direction = l2_normalize(l2_normalize(camera_coords) + torch.randn(3))
         light_distance = torch.rand(1) * (self.light_distance_range[1] - self.light_distance_range[0]) + self.light_distance_range[0]
-        light = light_direction * light_distance
+        # light = light_direction * light_distance
+        light_elevation = elevation + 60 * (2 * torch.rand(1) - 1)
+        light_azimuth = azimuth + 60 * (2 * torch.rand(1) - 1)
+        light = spherical_to_cartesian(light_azimuth * torch.pi / 180, light_elevation * torch.pi / 180, light_distance)
 
         if self.total_iterations < self.extra_args["albedo_steps"]:
             shading = 'albedo'
             ambient_ratio = 1.0
         else:
             rand = random.random()
-            if rand < 0.8:
-                if rand < 0.4:
+            if rand < 0.75:
+                if rand < 0.375:
                     ambient_ratio = 0.1
                     shading = 'lambertian'
                 else:
-                    ambient_ratio = 0.05
+                    ambient_ratio = 0.1
                     shading = 'textureless'
             else:
                 shading = 'albedo'
@@ -221,7 +253,7 @@ class MyTrainerSD(BaseTrainer):
 
         # Map to device
         if data is not None:
-            rays, img_gts, mask_gts = self.prepare_step_gt(data)
+            rays, img_gts = self.prepare_step_gt(data)
             kwargs = dict(use_light=False)
         else:
             rays, text_embeddings, shading, ambient_ratio, light = self.prepare_step_novel()
@@ -242,6 +274,9 @@ class MyTrainerSD(BaseTrainer):
             lod_idx = None
 
         with torch.cuda.amp.autocast():
+            phase = 'coarse'
+            if self.epoch > self.max_epochs * 0.7:
+                phase = 'fine'
             rb = self.pipeline(rays=rays,
                                lod_idx=lod_idx,
                                channels=["rgb",
@@ -250,12 +285,13 @@ class MyTrainerSD(BaseTrainer):
                                          "normal_pred",
                                          "entropy"],
                                stop_grad_channels=["orientation_reg"],
+                               diffusion_bg_color='noise',
+                               phase=phase,
                                **kwargs)
 
             if data is not None:
                 # RGB Loss
                 # rgb_loss = F.mse_loss(rb.rgb, img_gts, reduction='none')
-                bg = rb.bg[..., :3]
                 rgb_loss = torch.abs(rb.rgb[..., :3] - img_gts[..., :3])
                 rgb_loss = rgb_loss.mean()
 
@@ -265,24 +301,39 @@ class MyTrainerSD(BaseTrainer):
                 image = rb.rgb[..., :3]
                 image = image.reshape(1, self.diffusion_resolution, self.diffusion_resolution, 3)
                 image = image.permute(0, 3, 1, 2).contiguous()
+                weight_type = 'constant'
+                min_ratio = 0.02
+                max_ratio = 0.98
+                if self.epoch > self.max_epochs * 0.7:
+                    weight_type = 'quadratic'
+                    min_ratio = 0.02
+                    max_ratio = 0.60
                 diffusion_loss = self.diffusion.step(text_embeddings=text_embeddings,
                                                      image=image,
-                                                     guidance_scale=self.extra_args["guidance_scale"])
+                                                     guidance_scale=self.extra_args["guidance_scale"],
+                                                     min_ratio=min_ratio, max_ratio=max_ratio,
+                                                     weight_type=weight_type)
                 diffusion_loss = diffusion_loss.mean()
                 loss += self.extra_args["diffusion_loss"] * diffusion_loss
+                print("Iteration:", self.total_iterations,
+                      "Learning rate:", self.optimizer.param_groups[0]['lr'],
+                      "Diffusion loss: ", diffusion_loss.item())
 
-            if data is not None or self.total_iterations >= self.extra_args["albedo_steps"]:
+            if self.total_iterations >= self.max_iterations * 0.7:
+                factor = 1
+            elif self.total_iterations >= self.reg_warmup_iterations:
                 factor = 1
             else:
-                factor = 1
+                factor = self.reg_init_lr + (1 - self.reg_init_lr) * self.total_iterations / self.reg_warmup_iterations
             predicted_normal_loss = rb.predicted_normal_reg.mean()
             orientation_loss = rb.orientation_reg.mean()
             loss += factor * self.extra_args["predicted_normal_loss"] * predicted_normal_loss
             loss += factor * self.extra_args["orientation_loss"] * orientation_loss
-            opacity_loss = torch.sqrt(rb.opacity_sum ** 2 + 0.01).mean()
+            opacity_loss = torch.sqrt(rb.alpha ** 2 + 0.01).mean()
             loss += self.extra_args["opacity_loss"] * opacity_loss
             entropy_loss = rb.entropy.mean()
-            #entropy_loss = (-rb.opacity_sum * torch.log2(rb.opacity_sum) - (1 - rb.opacity_sum) * torch.log2(1 - rb.opacity_sum)).mean()
+            alphas = rb.alpha.clamp(1e-5, 1 - 1e-5)
+            alpha_loss = (-alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
             loss += self.extra_args["entropy_loss"] * entropy_loss
 
         self.log_dict['total_loss'] += loss.item()
@@ -290,6 +341,9 @@ class MyTrainerSD(BaseTrainer):
         self.scaler.scale(loss).backward()
         self.scaler.step(self.optimizer)
         self.scaler.update()
+
+        if self.scheduler is not None:
+            self.scheduler.step(self.epoch - 1 + (self.iteration - 1) / self.iterations_per_epoch)
 
     def log_cli(self):
         log_text = 'EPOCH {}/{}'.format(self.epoch, self.max_epochs)

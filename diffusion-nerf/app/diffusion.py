@@ -25,8 +25,6 @@ class Diffusion(nn.Module):
         self.scheduler = self.pipeline.scheduler
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
-        self.min_step = int(self.num_train_timesteps * 0.02)
-        self.max_step = int(self.num_train_timesteps * 0.98)
 
         self.transform = None
 
@@ -42,14 +40,18 @@ class Diffusion(nn.Module):
     def process_image(self, image):
         return image
 
-    def step(self, text_embeddings, image, guidance_scale=100):
-        if self.transform is not None:
-            image = self.transform(image)
+    def step(self, text_embeddings, image, guidance_scale=100,
+             min_ratio=0.02, max_ratio=0.98,
+             weight_type='constant'):
         detached_image = image.detach()
         detached_image.requires_grad = True
-        latent = self.process_image(detached_image)
+        if self.transform is not None:
+            latent = self.transform(detached_image)
+        latent = self.process_image(latent)
 
-        t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
+        min_step = int(self.num_train_timesteps * min_ratio)
+        max_step = int(self.num_train_timesteps * max_ratio)
+        t = torch.randint(min_step, max_step + 1, [1], dtype=torch.long, device=self.device)
         noise = torch.randn_like(latent)
         with torch.no_grad():
             noisy_latent = self.scheduler.add_noise(latent, noise, t)
@@ -58,12 +60,16 @@ class Diffusion(nn.Module):
         noise_pred_uncond, noise_pred_text = noise_preds
         noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-        w = (1 - self.scheduler.alphas_cumprod[t]) # **2
+        if weight_type == 'linear':
+            w = (1 - self.scheduler.alphas_cumprod[t])
+        elif weight_type == 'quadratic':
+            w = (1 - self.scheduler.alphas_cumprod[t])**2
+        else:
+            w = 1
         grad = w * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
 
         latent.backward(gradient=grad, retain_graph=True)
-        #loss = grad.detach() * latent
 
         image_grad = detached_image.grad
         loss = image_grad * image
