@@ -87,7 +87,7 @@ class MyApp(WispApp):
         # See also wisp_state.graph.channels and wisp.core.channels.channels_starter_kit for configuring channels.
         # Options: Any subset of channel names defined in wisp_state.graph.channels
         wisp_state.renderer.available_canvas_channels = ["rgb", "depth", "normal", "normal_pred",
-                                                         "albedo", "textureless", "lambertian"]
+                                                         "albedo", "textureless", "lambertian", "background"]
         wisp_state.renderer.selected_canvas_channel = "rgb"  # Channel selected by default
 
         # Lens mode for camera used to view the canvas.

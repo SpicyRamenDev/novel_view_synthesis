@@ -30,7 +30,7 @@ import time
 from kaolin.render.camera import Camera
 from wisp.ops.raygen.raygen import generate_centered_pixel_coords, generate_pinhole_rays
 
-from utils import spherical_to_cartesian, l2_normalize
+from utils import sample, spherical_to_cartesian, l2_normalize, sample_polar, sample_spherical_uniform, get_rotation_matrix
 import math
 
 
@@ -67,6 +67,9 @@ class DataLoaderGenerator(object):
             return None
 
 
+from PIL import Image
+import numpy as np
+
 class MyTrainerSD(BaseTrainer):
 
     def __init__(self, *args,
@@ -76,16 +79,8 @@ class MyTrainerSD(BaseTrainer):
 
         self.diffusion = diffusion
 
-        self.diffusion_resolution = self.extra_args["diffusion_resolution"]
-        self.camera_distance_range = self.extra_args["camera_distance_range"]
-        self.light_distance_range = self.extra_args["light_distance_range"]
-        self.azimuth_range = self.extra_args["azimuth_range"]
-        self.elevation_range = self.extra_args["elevation_range"]
-        self.camera_angle_range = self.extra_args["camera_angle_range"]
-        self.focal_length_multiplier_range = self.extra_args["focal_length_multiplier_range"]
-        self.camera_offset = self.extra_args["camera_offset"]
-        self.camera_up_std = self.extra_args["camera_up_std"]
-        self.look_at_std = self.extra_args["look_at_std"]
+        self.coarse_resolution = self.extra_args["coarse_resolution"]
+        self.fine_resolution = self.extra_args["fine_resolution"]
         self.num_novel_views_per_gt = self.extra_args["num_novel_views_per_gt"]
         self.num_novel_views_base = self.extra_args["num_novel_views_base"]
         self.bg_color = self.extra_args["bg_color"] if self.extra_args["bg_color"] != 'noise' else 'black'
@@ -95,8 +90,14 @@ class MyTrainerSD(BaseTrainer):
         self.reg_warmup_iterations = self.extra_args["reg_warmup_iterations"]
         self.reg_init_lr = self.extra_args["reg_init_lr"]
         # immutable
-        self.ray_grid = generate_centered_pixel_coords(self.diffusion_resolution, self.diffusion_resolution,
-                                                       self.diffusion_resolution, self.diffusion_resolution, device='cuda')
+        self.ray_grid = dict(
+            coarse=generate_centered_pixel_coords(self.coarse_resolution, self.coarse_resolution,
+                                                  self.coarse_resolution, self.coarse_resolution,
+                                                  device='cuda'),
+            fine=generate_centered_pixel_coords(self.fine_resolution, self.fine_resolution,
+                                                self.fine_resolution, self.fine_resolution,
+                                                device='cuda')
+        )
         if self.diffusion is not None:
             self.init_text_embeddings()
 
@@ -108,6 +109,51 @@ class MyTrainerSD(BaseTrainer):
                 t = (iteration - self.warmup_iterations) / (self.max_iterations - self.warmup_iterations)
                 return self.end_lr + 0.5 * (1 - self.end_lr) * (1 + math.cos(t * math.pi))
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, scheduler_function)
+
+    def init_optimizer(self):
+        """Default initialization for the optimizer.
+        """
+
+        params_dict = {name: param for name, param in self.pipeline.nef.named_parameters()}
+
+        params = []
+        decoder_params = []
+        decoder_bg_params = []
+        grid_params = []
+        rest_params = []
+
+        for name in params_dict:
+            if name == 'decoder_background':
+                decoder_bg_params.append(params_dict[name])
+
+            elif 'decoder' in name:
+                # If "decoder" is in the name, there's a good chance it is in fact a decoder,
+                # so use weight_decay
+                decoder_params.append(params_dict[name])
+
+            elif 'grid' in name:
+                # If "grid" is in the name, there's a good chance it is in fact a grid,
+                # so use grid_lr_weight
+                grid_params.append(params_dict[name])
+
+            else:
+                rest_params.append(params_dict[name])
+
+        params.append({"params": decoder_bg_params,
+                       "lr": self.lr * 0.1,
+                       "weight_decay": self.weight_decay})
+
+        params.append({"params": decoder_params,
+                       "lr": self.lr,
+                       "weight_decay": self.weight_decay})
+
+        params.append({"params": grid_params,
+                       "lr": self.lr * self.grid_lr_weight})
+
+        params.append({"params": rest_params,
+                       "lr": self.lr})
+
+        self.optimizer = self.optim_cls(params, **self.optim_params)
 
     def init_text_embeddings(self):
         if self.dataset is not None and self.num_novel_views_per_gt == 0:
@@ -130,10 +176,10 @@ class MyTrainerSD(BaseTrainer):
             text_embedding = self.diffusion.get_text_embedding(positive_cond, negative_cond)
             self.text_embeddings[view] = text_embedding
 
-    def get_text_embeddings(self, azimuth, elevation):
+    def get_text_embeddings(self, azimuth, polar):
         if not self.extra_args["use_view_prompt"]:
             return self.text_embeddings['']
-        if elevation > 60:
+        if polar < 30:
             view_prompt = 'overhead'
         elif 0 <= azimuth < 60:
             view_prompt = 'front'
@@ -174,66 +220,113 @@ class MyTrainerSD(BaseTrainer):
         self.log_dict['rgb_loss'] = 0.0
         self.log_dict['predicted_normal_loss'] = 0.0
 
-    def sample_all_rays(self, camera):
-        return generate_pinhole_rays(camera, self.ray_grid).reshape(camera.height, camera.width, 3)
+    def sample_all_rays(self, camera, phase="fine"):
+        return generate_pinhole_rays(camera, self.ray_grid[phase]).reshape(camera.height, camera.width, 3)
 
-    def prepare_step_gt(self, data):
+    def step_gt(self, data, phase="fine"):
+        if self.total_iterations < 2000:
+            lod_idx = None
+        else:
+            lod_idx = 8
+
         rays = data['rays'].to(self.device).squeeze(0)
         img_gts = data['imgs'].to(self.device).squeeze(0)
-        return rays, img_gts
 
-    def prepare_step_novel(self):
-        azimuth = torch.rand(1) * (self.azimuth_range[1] - self.azimuth_range[0]) + self.azimuth_range[0]
-        elevation = torch.rand(1) * (self.elevation_range[1] - self.elevation_range[0]) + self.elevation_range[0]
-        camera_offset = (2 * torch.rand(3) - 1) * self.camera_offset
-        camera_distance = torch.rand(1) * (self.camera_distance_range[1] - self.camera_distance_range[0]) + self.camera_distance_range[0]
-        camera_angle = torch.rand(1) * (self.camera_angle_range[1] - self.camera_angle_range[0]) + self.camera_angle_range[0]
-        focal_length_multiplier = torch.rand(1) * (self.focal_length_multiplier_range[1] - self.focal_length_multiplier_range[0]) + self.focal_length_multiplier_range[0]
-        camera_up = torch.tensor([0., 1., 0.]) + torch.randn(3) * self.camera_up_std
-        look_at = torch.randn(3) * self.look_at_std
+        loss = 0
 
-        if self.epoch > self.max_epochs * 0.7:
-            camera_angle *= 0.8
-            camera_distance *= 1
-            focal_length_multiplier *= 1.2
-        if self.total_iterations < 1000:
+        with torch.cuda.amp.autocast():
+            rb = self.pipeline(rays=rays,
+                               lod_idx=lod_idx,
+                               channels=["rgb",
+                                         "predicted_normal_reg",
+                                         "orientation_reg",
+                                         "normal_pred"],
+                               stop_grad_channels=["orientation_reg", "predicted_normal_reg"],
+                               phase=phase,
+                               use_light=False)
+
+            # RGB Loss
+            # rgb_loss = F.mse_loss(rb.rgb, img_gts, reduction='none')
+            rgb_loss = torch.abs(rb.rgb[..., :3] - img_gts[..., :3])
+            rgb_loss = rgb_loss.sum(-1)
+            rgb_loss = rgb_loss.sum()
+
+            loss += self.extra_args["rgb_loss"] * rgb_loss
+            self.log_dict['rgb_loss'] += rgb_loss.item()
+
+            predicted_normal_loss = rb.predicted_normal_reg.sum()
+            orientation_loss = rb.orientation_reg.sum()
+            loss += self.extra_args["predicted_normal_loss"] * predicted_normal_loss
+            loss += self.extra_args["orientation_loss"] * orientation_loss
+            opacity_loss = torch.sqrt(rb.alpha ** 2 + 0.01).sum()
+            loss += self.extra_args["opacity_loss"] * opacity_loss
+            entropy_loss = rb.entropy.sum()
+            alphas = rb.alpha.clamp(1e-5, 1 - 1e-5)
+            alpha_loss = (-alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).sum()
+            loss += self.extra_args["entropy_loss"] * entropy_loss
+
+        return loss
+
+    def prepare_novel_view(self, phase="fine"):
+        camera_dir, azimuth, polar = sample_spherical_uniform(azimuth_range=self.extra_args["azimuth_range"],
+                                                              polar_range=self.extra_args["polar_range"])
+        camera_offset = (2 * torch.rand(3) - 1) * self.extra_args["camera_offset"]
+        camera_distance = sample(self.extra_args["camera_distance_range"])
+        camera_angle = sample(self.extra_args["camera_angle_range"])
+        focal_length_multiplier = sample(self.extra_args["focal_length_multiplier_range"])
+        camera_up = torch.tensor([0., 1., 0.]) + torch.randn(3) * self.extra_args["camera_up_std"]
+        look_at = torch.randn(3) * self.extra_args["look_at_std"]
+
+        if phase == "fine":
+            camera_distance *= 2
+            focal_length_multiplier *= 1.
+        if False and self.total_iterations < 1000:
             focal_length_multiplier = 1.0
 
-        camera_coords = spherical_to_cartesian(azimuth * torch.pi / 180, elevation * torch.pi / 180, camera_distance)
-        #camera_coords += camera_offset
-        camera_coords = camera_coords
+        resolution = self.extra_args[f"{phase}_resolution"]
+        camera_coords = camera_dir * camera_distance + camera_offset
         fov = camera_angle * torch.pi / 180
-        focal_length = 0.5 * self.diffusion_resolution * (camera_distance - 0.3) * focal_length_multiplier
-        # focal_length = self.diffusion_resolution * focal_length_multiplier
+        focal_length = 0.5 * resolution * (camera_distance - 0.) * focal_length_multiplier
+        # focal_length = resolution * focal_length_multiplier
         camera = Camera.from_args(
             eye=camera_coords,
             at=look_at,
             up=camera_up,
             # fov=fov,
             focal_x=focal_length,
-            width=self.diffusion_resolution, height=self.diffusion_resolution,
-            near=max(camera_distance-2, 0.0), # 1e-2,
-            far=camera_distance+2, # 6.0,
+            width=resolution, height=resolution,
+            near=max(camera_distance-2, 0.0),  # 1e-2,
+            far=camera_distance+2,  # 6.0,
             dtype=torch.float32,
             device='cuda'
         )
-        rays = self.sample_all_rays(camera)
-        rays = rays.reshape(self.diffusion_resolution ** 2, -1)
 
-        # light_direction = l2_normalize(l2_normalize(camera_coords) + torch.randn(3))
-        light_distance = torch.rand(1) * (self.light_distance_range[1] - self.light_distance_range[0]) + self.light_distance_range[0]
-        # light = light_direction * light_distance
-        light_elevation = elevation + 60 * (2 * torch.rand(1) - 1)
-        light_azimuth = azimuth + 60 * (2 * torch.rand(1) - 1)
-        light = spherical_to_cartesian(light_azimuth * torch.pi / 180, light_elevation * torch.pi / 180, light_distance)
+        light_dir, light_azimuth, light_polar = sample_spherical_uniform(polar_range=(30, 90))
+        light_rot = get_rotation_matrix(light_azimuth, light_polar)
+        light_dir = light_rot @ camera_dir
+        light_distance = sample(self.extra_args["light_distance_range"])
+        light = light_dir * light_distance
 
+        text_embeddings = self.get_text_embeddings(azimuth, polar)
+
+        rays = self.sample_all_rays(camera, phase)
+        rays = rays.reshape(resolution ** 2, -1)
+
+        return dict(rays=rays, camera=camera, light=light, text_embeddings=text_embeddings)
+
+    def sample_rays_gaussian(self, rays, num_samples):
+        idx = torch.multinomial(self.pgrid, num_samples)
+        output = rays[idx].contiguous()
+        return output
+
+    def get_novel_view_render_parameters(self, phase="fine"):
         if self.total_iterations < self.extra_args["albedo_steps"]:
             shading = 'albedo'
             ambient_ratio = 1.0
         else:
             rand = random.random()
             if rand < 0.75:
-                if rand < 0.375:
+                if True or rand < 0.375:
                     ambient_ratio = 0.1
                     shading = 'lambertian'
                 else:
@@ -242,103 +335,161 @@ class MyTrainerSD(BaseTrainer):
             else:
                 shading = 'albedo'
                 ambient_ratio = 1.0
+        bg_color_value = torch.rand(3, device='cuda')
+        return dict(shading=shading, ambient_ratio=ambient_ratio, bg_color_value=bg_color_value)
 
-        text_embeddings = self.get_text_embeddings(azimuth, elevation)
+    def get_diffusion_parameters(self, phase="fine"):
+        if phase == 'coarse':
+            weight_type = 'constant'
+            min_ratio = 0.02
+            max_ratio = 0.98
+        else:
+            weight_type = 'quadratic'
+            min_ratio = 0.02
+            max_ratio = 0.60
+        guidance_scale=self.extra_args["guidance_scale"]
 
-        return rays, text_embeddings, shading, ambient_ratio, light
+        return dict(weight_type=weight_type, min_ratio=min_ratio, max_ratio=max_ratio, guidance_scale=guidance_scale)
+
+    def step_novel_view(self, phase="fine"):
+        if "phase" == "fine":
+            lod_idx = None
+        else:
+            lod_idx = 8
+
+        render_parameters = self.get_novel_view_render_parameters(phase)
+        diffusion_parameters = self.get_diffusion_parameters(phase)
+
+        scene = self.prepare_novel_view(phase=phase)
+        rays = scene['rays']
+        light = scene['light']
+        camera = scene['camera']
+        text_embeddings = scene['text_embeddings']
+
+        nerf_parameters = dict(lod_idx=lod_idx,
+                               channels=["rgb",
+                                         "predicted_normal_reg",
+                                         "orientation_reg"],
+                               stop_grad_channels=["orientation_reg", "predicted_normal_reg"],
+                               compute_entropy=True,
+                               phase=phase,
+                               use_light=True,
+                               light=light,
+                               bg_color='decoder',
+                               **render_parameters)
+        render_only_nerf_parameters = dict(lod_idx=lod_idx,
+                                           channels=["rgb"],
+                                           phase=phase,
+                                           use_light=True,
+                                           light=light,
+                                           bg_color='decoder',
+                                           **render_parameters)
+
+        diffusion_parameters = dict(text_embeddings=text_embeddings, **diffusion_parameters)
+
+        total_loss_value = 0
+
+        if self.total_iterations >= self.reg_warmup_iterations:
+            reg_factor = 1
+        else:
+            reg_factor = self.reg_init_lr + (1 - self.reg_init_lr) * self.total_iterations / self.reg_warmup_iterations
+
+        if 0 < self.extra_args["render_batch"] < rays.shape[0]:
+            image_batches = []
+            with torch.no_grad():
+                for ray_pack in rays.split(self.extra_args["render_batch"]):
+                    rb = self.pipeline(rays=ray_pack, **render_only_nerf_parameters)
+                    image_batches.append(rb.rgb[..., :3])
+                    del rb
+                image = torch.cat(image_batches, dim=0)
+                image = image.reshape(1, camera.width, camera.height, 3)
+                image = image.permute(0, 3, 1, 2).contiguous()
+            with torch.cuda.amp.autocast():
+                diffusion_grad = self.diffusion.step(image=image, **diffusion_parameters)
+                diffusion_grad = diffusion_grad.reshape(3, -1).contiguous()
+
+                for i, ray_pack in enumerate(rays.split(self.extra_args["render_batch"])):
+                    pack_loss = 0
+
+                    rb = self.pipeline(rays=ray_pack, **nerf_parameters)
+                    pack_image = rb.rgb[..., :3]
+                    pack_image = pack_image.reshape(self.extra_args["render_batch"], 3)
+                    pack_image = pack_image.permute(1, 0).contiguous()
+                    start, end = i * self.extra_args["render_batch"], (i + 1) * self.extra_args["render_batch"]
+                    pack_diffusion_grad = diffusion_grad[..., start:end]
+                    pack_diffusion_loss = (pack_diffusion_grad * pack_image).sum(1)
+                    pack_diffusion_loss = pack_diffusion_loss.sum() / (64 * 64)
+                    pack_loss += self.extra_args["diffusion_loss"] * pack_diffusion_loss
+
+                    predicted_normal_loss = rb.predicted_normal_reg.mean()
+                    orientation_loss = rb.orientation_reg.mean()
+                    opacity_loss = torch.sqrt(rb.alpha ** 2 + 0.01).mean()
+                    entropy_loss = rb.entropy.mean()
+                    pack_loss += reg_factor * self.extra_args["predicted_normal_loss"] * predicted_normal_loss
+                    pack_loss += reg_factor * self.extra_args["orientation_loss"] * orientation_loss
+                    pack_loss += self.extra_args["opacity_loss"] * opacity_loss
+                    pack_loss += self.extra_args["entropy_loss"] * entropy_loss
+
+                    self.scaler.scale(pack_loss).backward()
+                    total_loss_value += pack_loss.item()
+
+                    del rb
+        else:
+            loss = 0
+
+            with torch.cuda.amp.autocast():
+                rb = self.pipeline(rays=rays, **nerf_parameters)
+                image = rb.rgb[..., :3]
+                image = image.reshape(1, camera.width, camera.height, 3)
+                image = image.permute(0, 3, 1, 2).contiguous()
+                diffusion_grad = self.diffusion.step(image=image, **diffusion_parameters)
+                diffusion_loss = (diffusion_grad * image).sum(1)
+                diffusion_loss = diffusion_loss.sum() / (64 * 64)
+                loss += self.extra_args["diffusion_loss"] * diffusion_loss
+
+                predicted_normal_loss = rb.predicted_normal_reg.mean()
+                orientation_loss = rb.orientation_reg.mean()
+                opacity_loss = torch.sqrt(rb.alpha ** 2 + 0.01).mean()
+                entropy_loss = rb.entropy.mean()
+                loss += reg_factor * self.extra_args["predicted_normal_loss"] * predicted_normal_loss
+                loss += reg_factor * self.extra_args["orientation_loss"] * orientation_loss
+                loss += self.extra_args["opacity_loss"] * opacity_loss
+                loss += self.extra_args["entropy_loss"] * entropy_loss
+
+                self.scaler.scale(loss).backward()
+                total_loss_value += loss.item()
+
+        print("Iteration:", self.total_iterations,
+              "Learning rate:", self.optimizer.param_groups[0]['lr'],
+              "Diffusion loss: ", total_loss_value)
+        # alphas = rb.alpha.clamp(1e-5, 1 - 1e-5)
+        # alpha_loss = (-alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
+        #
+        if self.total_iterations % 5 == 0:
+            image = diffusion_grad.reshape(1, 3, camera.width, camera.height).clamp(0, 1)
+            image = image.permute(0, 2, 3, 1).contiguous()
+            pil_image = Image.fromarray((image[0].detach().cpu().numpy() * 255).astype(np.uint8))
+            pil_image.save("image.png")
+
+        return total_loss_value
 
     def step(self, data):
         """Implement the optimization over image-space loss.
         """
 
-        # Map to device
-        if data is not None:
-            rays, img_gts = self.prepare_step_gt(data)
-            kwargs = dict(use_light=False)
+        if self.total_iterations < self.max_iterations * self.extra_args["coarse_ratio"]:
+            phase = "coarse"
         else:
-            rays, text_embeddings, shading, ambient_ratio, light = self.prepare_step_novel()
-            kwargs = dict(shading=shading, ambient_ratio=ambient_ratio, light=light, use_light=True)
+            phase = "fine"
 
         self.optimizer.zero_grad()
 
-        loss = 0
-
-        if self.extra_args["random_lod"]:
-            # Sample from a geometric distribution
-            population = [i for i in range(self.pipeline.nef.grid.num_lods)]
-            weights = [2 ** i for i in range(self.pipeline.nef.grid.num_lods)]
-            weights = [i / sum(weights) for i in weights]
-            lod_idx = random.choices(population, weights)[0]
+        if data is not None:
+            loss_item = self.step_gt(data, phase=phase)
         else:
-            # Sample only the max lod (None is max lod by default)
-            lod_idx = None
+            loss_item = self.step_novel_view(phase=phase)
 
-        with torch.cuda.amp.autocast():
-            phase = 'coarse'
-            if self.epoch > self.max_epochs * 0.7:
-                phase = 'fine'
-            rb = self.pipeline(rays=rays,
-                               lod_idx=lod_idx,
-                               channels=["rgb",
-                                         "predicted_normal_reg",
-                                         "orientation_reg",
-                                         "normal_pred",
-                                         "entropy"],
-                               stop_grad_channels=["orientation_reg"],
-                               diffusion_bg_color='noise',
-                               phase=phase,
-                               **kwargs)
-
-            if data is not None:
-                # RGB Loss
-                # rgb_loss = F.mse_loss(rb.rgb, img_gts, reduction='none')
-                rgb_loss = torch.abs(rb.rgb[..., :3] - img_gts[..., :3])
-                rgb_loss = rgb_loss.mean()
-
-                loss += self.extra_args["rgb_loss"] * rgb_loss
-                self.log_dict['rgb_loss'] += rgb_loss.item()
-            else:
-                image = rb.rgb[..., :3]
-                image = image.reshape(1, self.diffusion_resolution, self.diffusion_resolution, 3)
-                image = image.permute(0, 3, 1, 2).contiguous()
-                weight_type = 'constant'
-                min_ratio = 0.02
-                max_ratio = 0.98
-                if self.epoch > self.max_epochs * 0.7:
-                    weight_type = 'quadratic'
-                    min_ratio = 0.02
-                    max_ratio = 0.60
-                diffusion_loss = self.diffusion.step(text_embeddings=text_embeddings,
-                                                     image=image,
-                                                     guidance_scale=self.extra_args["guidance_scale"],
-                                                     min_ratio=min_ratio, max_ratio=max_ratio,
-                                                     weight_type=weight_type)
-                diffusion_loss = diffusion_loss.mean()
-                loss += self.extra_args["diffusion_loss"] * diffusion_loss
-                print("Iteration:", self.total_iterations,
-                      "Learning rate:", self.optimizer.param_groups[0]['lr'],
-                      "Diffusion loss: ", diffusion_loss.item())
-
-            if self.total_iterations >= self.max_iterations * 0.7:
-                factor = 1
-            elif self.total_iterations >= self.reg_warmup_iterations:
-                factor = 1
-            else:
-                factor = self.reg_init_lr + (1 - self.reg_init_lr) * self.total_iterations / self.reg_warmup_iterations
-            predicted_normal_loss = rb.predicted_normal_reg.mean()
-            orientation_loss = rb.orientation_reg.mean()
-            loss += factor * self.extra_args["predicted_normal_loss"] * predicted_normal_loss
-            loss += factor * self.extra_args["orientation_loss"] * orientation_loss
-            opacity_loss = torch.sqrt(rb.alpha ** 2 + 0.01).mean()
-            loss += self.extra_args["opacity_loss"] * opacity_loss
-            entropy_loss = rb.entropy.mean()
-            alphas = rb.alpha.clamp(1e-5, 1 - 1e-5)
-            alpha_loss = (-alphas * torch.log2(alphas) - (1 - alphas) * torch.log2(1 - alphas)).mean()
-            loss += self.extra_args["entropy_loss"] * entropy_loss
-
-        self.log_dict['total_loss'] += loss.item()
-
-        self.scaler.scale(loss).backward()
+        self.log_dict['total_loss'] += loss_item
         self.scaler.step(self.optimizer)
         self.scaler.update()
 

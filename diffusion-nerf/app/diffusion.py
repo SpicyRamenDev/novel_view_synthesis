@@ -69,9 +69,8 @@ class Diffusion(nn.Module):
         grad = w * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
 
-        latent.backward(gradient=grad, retain_graph=True)
+        latent.backward(gradient=grad)
 
         image_grad = detached_image.grad
-        loss = image_grad * image
 
-        return loss
+        return image_grad

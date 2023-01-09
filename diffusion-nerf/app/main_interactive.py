@@ -109,14 +109,14 @@ def parse_args():
                                     help='Reg warmup iterations.')
     my_optimizer_group.add_argument('--reg-init-lr', type=float, default=1e-5,
                                     help='Reg init iterations.')
+    my_optimizer_group.add_argument('--coarse-ratio', type=float, default=0.5,
+                                    help='Coarse ratio of iterations.')
 
     my_camera_group = parser.add_argument_group('my_camera')
-    my_camera_group.add_argument('--diffusion-resolution', type=int, default=64,
-                                 help='Resolution of the diffusion input.')
     my_camera_group.add_argument('--azimuth-range', nargs=2, type=float, default=[0, 360],
                                  help='Azimuth range of the camera.')
-    my_camera_group.add_argument('--elevation-range', nargs=2, type=float, default=[0, 360],
-                                 help='Elevation range of the camera.')
+    my_camera_group.add_argument('--polar-range', nargs=2, type=float, default=[0, 100],
+                                 help='Polar range of the camera.')
     my_camera_group.add_argument('--camera-distance-range', nargs=2, type=float, default=[3.5, 4.5],
                                  help='Range of the camera distance.')
     my_camera_group.add_argument('--camera-angle-range', nargs=2, type=float, default=[25, 42],
@@ -131,6 +131,10 @@ def parse_args():
                                  help='Std of the look up vector.')
     my_camera_group.add_argument('--light-distance-range', nargs=2, type=float, default=[0.8, 1.5],
                                  help='Std of the look up vector.')
+    my_camera_group.add_argument('--coarse-resolution', type=int, default=64,
+                                 help='Coarse resolution.')
+    my_camera_group.add_argument('--fine-resolution', type=int, default=512,
+                                 help='Fine resolution.')
 
     args, args_str = argparse_to_str(parser)
     return args, args_str

@@ -20,25 +20,43 @@ import numpy as np
 from kaolin.render.camera import Camera
 
 
-def spherical_to_cartesian(azimuth, elevation, distance):
-    x = distance * torch.cos(elevation) * torch.sin(azimuth)
-    y = distance * torch.sin(elevation)
-    z = distance * torch.cos(elevation) * torch.cos(azimuth)
-    return torch.stack([x, y, z], dim=-1)
+def sample(value_range=(0, 1)):
+    return value_range[0] + (value_range[1] - value_range[0]) * torch.rand(1)
 
 
-def sample_unit_vector(min_elevation=-10):
-    """Sample a random unit vector with elevation above min_elevation."""
-    # Sample a random azimuth and elevation.
-    azimuth = torch.rand(1) * 2 * torch.pi
-    r_min, r_max = torch.cos(min_elevation), 1.0 - 1e-10
-    elevation = torch.acos(torch.rand(1) * (r_max - r_min) + r_min)
+def spherical_to_cartesian(azimuth, polar, distance=1.0):
+    x = distance * torch.sin(polar) * torch.sin(azimuth)
+    y = distance * torch.cos(polar)
+    z = distance * torch.sin(polar) * torch.cos(azimuth)
+    return torch.tensor([x, y, z])
 
-    # Convert to a unit vector.
-    x = torch.sin(elevation) * torch.sin(azimuth)
-    y = torch.sin(elevation) * torch.cos(azimuth)
-    z = torch.cos(elevation)
-    return torch.stack([x, y, z], dim=-1)
+
+def get_rotation_matrix(azimuth, polar):
+    azimuth = azimuth * torch.pi / 180.0
+    polar = polar * torch.pi / 180.0
+    cos_azimuth, cos_polar = torch.cos(azimuth), torch.cos(polar)
+    sin_azimuth, sin_polar = torch.sin(azimuth), torch.sin(polar)
+    return torch.tensor([
+        [cos_azimuth * cos_polar, -sin_azimuth, cos_azimuth * sin_polar],
+        [sin_azimuth * cos_polar, cos_azimuth, sin_azimuth * sin_polar],
+        [-sin_polar, 0, cos_polar]
+    ])
+
+
+def sample_polar(polar_range=(0, 100)):
+    max_polar = min(polar_range[1] * torch.pi / 180.0, torch.pi - torch.finfo(torch.float32).eps)
+    min_polar = max(polar_range[0] * torch.pi / 180.0, torch.finfo(torch.float32).eps)
+    cos_max, cos_min = torch.cos(torch.tensor([min_polar, max_polar]))
+    polar = torch.acos(sample((cos_min, cos_max))) * 180.0 / torch.pi
+    return polar
+
+
+def sample_spherical_uniform(azimuth_range=(0, 360), polar_range=(-10, 90)):
+    azimuth = sample(azimuth_range)
+    polar = sample_polar(polar_range)
+
+    coords = spherical_to_cartesian(azimuth * torch.pi / 180.0, polar * torch.pi / 180.0)
+    return coords, azimuth, polar
 
 
 def reflect(viewdirs, normals):

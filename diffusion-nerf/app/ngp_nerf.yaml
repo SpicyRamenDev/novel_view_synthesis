@@ -25,7 +25,7 @@ renderer:
     tracer_type: 'MyPackedRFTracer'
     num_steps: 512
     raymarch_type: ray
-    render_batch: 4000
+    render_batch: 8192  # 4096
     camera_origin:
         - -3.0
         - 0.65
@@ -49,16 +49,16 @@ grid:
     grid_type: 'HashGrid'
     interpolation_type: 'linear'
     multiscale_type: 'cat'
-    feature_dim: 4
+    feature_dim: 4  # 4
     feature_std: 0.01
     num_lods: 16
     tree_type: 'geometric'
-    max_grid_res: 4096 # 2048 # 4096
+    max_grid_res: 4096  # 4096
     codebook_bitwidth: 19
 
 net:
     nef_type: 'MyNeuralRadianceField'
-    hidden_dim: 32
+    hidden_dim: 64
     num_layers: 1
     out_dim: 7
     position_input: True
@@ -72,21 +72,22 @@ my_nef:
     view_embedder: 'spherical'
     use_blob: True
     blob_scale: 5.0
-    blob_width: 0.4
+    blob_width: 0.3
     bottleneck_dim: 8
 
 my_optimizer:
-    orientation_loss: 0.03
+    orientation_loss: 0.05
     predicted_normal_loss: 0.1 # 0.05
     opacity_loss: 0.002
-    entropy_loss: 0.001
+    entropy_loss: 0.002
     albedo_steps: 1000
     diffusion_loss: 1.0
-    warmup_iterations: 0 # 300
-    init_lr: 0.3
-    end_lr: 0.3
-    reg_warmup_iterations: 1000
+    warmup_iterations: 0
+    init_lr: 0.1
+    end_lr: 0.5
+    reg_warmup_iterations: 0 #1000
     reg_init_lr: 0.1
+    coarse_ratio: 0.5
 
 my_diffusion:
     repo_id: 'stabilityai/stable-diffusion-2-1-base'
@@ -99,25 +100,26 @@ my_diffusion:
 my_camera:
     num_novel_views_per_gt: 0
     num_novel_views_base: 100
-    diffusion_resolution: 64
+    coarse_resolution: 64
+    fine_resolution: 256
     light_distance_range:
-        - 1.2 # 0.8
-        - 2.25 # 1.5
+        - 1.0 # 0.8
+        - 1.5 # 1.5
     camera_distance_range:
-        - 1.5 # 1.0
-        - 3.0 # 1.5
+        - 1.1 # 1.0
+        - 1.5 # 1.5
     azimuth_range:
         - 0
         - 360
-    elevation_range:
-        - -10
-        - 90
+    polar_range:
+        - 0
+        - 100
     camera_angle_range:
         - 25
         - 42
     focal_length_multiplier_range:
-        - 0.92 # 0.7
-        - 1.25 # 1.35
+        - 1.0 # 0.7
+        - 2.0 # 1.35
     camera_offset: 0.1
     camera_up_std: 0.02
     look_at_std: 0.1

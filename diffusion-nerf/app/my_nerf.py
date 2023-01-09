@@ -64,15 +64,17 @@ class MyNeuralRadianceField(BaseNeuralField):
         else:
             self.pos_embedder, self.pos_embed_dim = None, 0
         self.view_embedder, self.view_embed_dim = self.init_embedder(view_embedder, view_multires)
+        self.bg_view_embedder, self.bg_view_embed_dim = self.init_embedder(view_embedder, 2)
 
         # Init Decoder
         self.activation_type = activation_type
         self.layer_type = layer_type
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.bottnleneck_dim = bottleneck_dim
-        self.decoder_spatial, self.decoder_directional = \
+        self.bottleneck_dim = bottleneck_dim
+        self.decoder_spatial, self.decoder_directional, self.decoder_background = \
             self.init_decoders(activation_type, layer_type, num_layers, hidden_dim, bottleneck_dim)
+        self.density_activation = torch.nn.Softplus()
 
         self.prune_density_decay = prune_density_decay
         self.prune_min_density = prune_min_density
@@ -120,7 +122,16 @@ class MyNeuralRadianceField(BaseNeuralField):
                                            hidden_dim=hidden_dim,
                                            skip=[])
 
-        return decoder_spatial, decoder_directional
+        decoder_background = BasicDecoder(input_dim=self.background_net_input_dim,
+                                          output_dim=3,
+                                          activation=get_activation_class(activation_type),
+                                          bias=True,
+                                          layer=get_layer_class(layer_type),
+                                          num_layers=1,
+                                          hidden_dim=16,
+                                          skip=[])
+
+        return decoder_spatial, decoder_directional, decoder_background
 
     def prune(self):
         """Prunes the blas based on current state.
@@ -163,6 +174,7 @@ class MyNeuralRadianceField(BaseNeuralField):
         self._register_forward_function(self.features, ["density", "rgb", "normal", "normal_pred",
                                                         "predicted_normal_reg", "orientation_reg",
                                                         *self.extra_channels])
+        self._register_forward_function(self.background, ["background"])
 
     def density_blob(self, coords, scale, width):
         d2 = (coords ** 2).sum(axis=-1, keepdim=True)
@@ -171,8 +183,9 @@ class MyNeuralRadianceField(BaseNeuralField):
         # density = scale * (1 - d / width)
         return density
 
-    def density(self, coords):
-        lod_idx = len(self.grid.active_lods) - 1
+    def density(self, coords, lod_idx=None):
+        if lod_idx is None:
+            lod_idx = len(self.grid.active_lods) - 1
         batch, _ = coords.shape
 
         # Embed coordinates into high-dimensional vectors with the grid.
@@ -187,9 +200,15 @@ class MyNeuralRadianceField(BaseNeuralField):
         density_feats = self.decoder_spatial(feats)[..., 0:1]
         if self.use_blob:
             density_feats += self.density_blob(coords, self.blob_scale, self.blob_width)
-        density = torch.relu(density_feats)
+        density = self.density_activation(density_feats)
 
         return density
+
+    def background(self, coords, ray_d):
+        embedded_view = self.bg_view_embedder(ray_d).view(-1, self.background_net_input_dim)
+        color = self.decoder_background(embedded_view)
+        color = torch.sigmoid(color)
+        return dict(background=color)
 
     def features(self, coords, ray_d, lod_idx=None, channels=[],
                  ambient_ratio=0.1, shading='lambertian', light=None,
@@ -226,20 +245,26 @@ class MyNeuralRadianceField(BaseNeuralField):
         # density ~ (batch, 1)
         density_feats = spatial_feats[..., 0:1]
         albedo_color = spatial_feats[..., 1:4]
-        normal_pred = spatial_feats[..., 4:7]
+        normal_pred_raw = spatial_feats[..., 4:7]
         bottleneck = None #spatial_feats[..., 7:]
 
         if self.use_blob:
             density_feats += self.density_blob(coords, self.blob_scale, self.blob_width)
-        density = torch.relu(density_feats)
+        density = self.density_activation(density_feats)
         albedo_color = torch.sigmoid(albedo_color)
-        normal_pred = l2_normalize(normal_pred)
+        normal_pred = l2_normalize(normal_pred_raw)
         normal_pred = torch.nan_to_num(normal_pred)
-        normal = self.normal(coords, method="finitediff with grad")
 
-        predicted_normal_reg = 1.0 - torch.sum(normal * normal_pred, axis=-1, keepdim=True)
-        # predicted_normal_reg = compute_mean_angular_error(normal, normal_pred)
-        orientation_reg = torch.sum(torch.clamp(normal_pred * ray_d, min=0) ** 2, axis=-1, keepdim=True)
+        normal = None
+        predicted_normal_reg = None
+        if "normal" in channels or "predicted_normal_reg" in channels:
+            normal = self.normal(coords, lod_idx=lod_idx, method="finitediff with grad")
+        if "predicted_normal_reg" in channels:
+            predicted_normal_reg = 1 - torch.sum(normal * normal_pred, axis=-1, keepdim=True)
+            # predicted_normal_reg = compute_mean_angular_error(normal, normal_pred)
+        orientation_reg = None
+        if "orientation_reg" in channels:
+            orientation_reg = torch.sum(torch.clamp(normal_pred * ray_d, min=0) ** 2, axis=-1, keepdim=True)
 
         # Colors are values [0, 1] floats
         # colors ~ (batch, 3)
@@ -250,7 +275,7 @@ class MyNeuralRadianceField(BaseNeuralField):
             ambient_ratio = 1.0
         elif "textureless" in channels:
             shading = "textureless"
-            ambient_ratio = 0.0
+            ambient_ratio = 0.1
         elif "lambertian" in channels:
             shading = "lambertian"
             ambient_ratio = 0.1
@@ -259,7 +284,8 @@ class MyNeuralRadianceField(BaseNeuralField):
             if light is None:
                 light = 2 * torch.tensor([1., 1., 1.], device=self.device)
             if shading == 'textureless':
-                albedo_color = torch.ones_like(albedo_color)
+                # albedo_color = torch.ones_like(albedo_color)
+                albedo_color = albedo_color.detach()
             light_dir = l2_normalize(light - coords)
             light_diffuse = (normal_pred * light_dir).sum(axis=-1, keepdim=True).clamp(min=0)
             colors = albedo_color * ((1 - ambient_ratio) * light_diffuse + ambient_ratio)
@@ -280,15 +306,20 @@ class MyNeuralRadianceField(BaseNeuralField):
         elif "lambertian" in channels:
             lambertian = colors
 
-        return dict(rgb=colors, density=density, normal=normal,
-                    normal_pred=normal_pred,
+        if "normal" not in channels:
+            normal = None
+        if "normal_pred" not in channels:
+            normal_pred = None
+
+        return dict(rgb=colors, density=density,
+                    normal=normal, normal_pred=normal_pred,
                     predicted_normal_reg=predicted_normal_reg,
                     orientation_reg=orientation_reg,
                     albedo=albedo, lambertian=lambertian, textureless=textureless)
 
-    def normal(self, coords, method="finitediff", eps=0.005):
+    def normal(self, coords, lod_idx=None, method="finitediff", eps=0.005):
         def f(x):
-            return self.density(x)
+            return self.density(x, lod_idx=lod_idx)
         if method == "autograd":
             gradient = autodiff_gradient(coords, f)
         elif method == "finitediff":
@@ -320,4 +351,8 @@ class MyNeuralRadianceField(BaseNeuralField):
 
     @property
     def directional_net_input_dim(self):
-        return self.bottnleneck_dim + self.view_embed_dim
+        return self.bottleneck_dim + self.view_embed_dim
+
+    @property
+    def background_net_input_dim(self):
+        return self.bg_view_embed_dim

@@ -68,7 +68,9 @@ class MyPackedRFTracer(BaseTracer):
 
     def trace(self, nef, channels, extra_channels, rays,
               lod_idx=None, raymarch_type='voxel', num_steps=64, step_size=1.0, bg_color='white',
-              stop_grad_channels=[], entropy_threshold=0.01, diffusion_bg_color='', **kwargs):
+              stop_grad_channels=[], entropy_threshold=0.01, bg_color_value=None,
+              compute_entropy=False,
+              **kwargs):
         """Trace the rays against the neural field.
 
         Args:
@@ -100,13 +102,14 @@ class MyPackedRFTracer(BaseTracer):
         else:
             depth = None
 
-        if diffusion_bg_color != '':
-            bg_color = diffusion_bg_color
+        if 'background' in channels:
+            bg_color = 'decoder'
         if bg_color == 'white':
             rgb = torch.ones(N, 3, device=rays.origins.device)
         elif bg_color == 'noise':
-            rand_bg_color = torch.rand(3, device=rays.origins.device)
-            rgb = rand_bg_color * torch.ones(N, 3, device=rays.origins.device)
+            rgb = bg_color_value * torch.ones(N, 3, device=rays.origins.device)
+        elif bg_color == 'decoder':
+            rgb = nef.background(rays.origins, rays.dirs)["background"]
         else:
             rgb = torch.zeros(N, 3, device=rays.origins.device)
         hit = torch.zeros(N, device=rays.origins.device, dtype=torch.bool)
@@ -146,7 +149,8 @@ class MyPackedRFTracer(BaseTracer):
             ray_depth = spc_render.sum_reduce(depths.reshape(-1, 1) * transmittance, boundary)
             depth[ridx_hit, :] = ray_depth
 
-        alpha = spc_render.sum_reduce(transmittance, boundary)
+        # alpha = spc_render.sum_reduce(transmittance, boundary)
+        alpha = 1.0 - torch.exp(spc_render.sum_reduce(-tau, boundary))
         out_alpha[ridx_hit] = alpha
         hit[ridx_hit] = alpha[..., 0] > 0.0
 
@@ -154,9 +158,12 @@ class MyPackedRFTracer(BaseTracer):
         if bg_color == 'white':
             color = torch.clamp((1.0 - alpha) + ray_colors, max=1.0)
         elif bg_color == 'noise':
-            color = (1.0 - alpha) * rand_bg_color + alpha * ray_colors
+            color = (1.0 - alpha) * bg_color_value + ray_colors
+        elif bg_color == 'decoder':
+            color = (1.0 - alpha) * rgb[ridx_hit] + ray_colors
         else:
-            color = alpha * ray_colors
+            color = ray_colors
+        rgb = rgb.type(color.dtype)
         rgb[ridx_hit] = color
 
         extra_outputs = {}
@@ -164,27 +171,23 @@ class MyPackedRFTracer(BaseTracer):
             feats = queried_features[channel]
             num_channels = feats.shape[-1]
             if channel in stop_grad_channels:
-                ray_feats, transmittance = spc_render.exponential_integration(
-                    feats.view(-1, num_channels), tau.detach(), boundary, exclusive=True
-                )
-                composited_feats = alpha.detach() * ray_feats
+                ray_feats = spc_render.sum_reduce(feats.view(-1, num_channels) * transmittance.detach(), boundary)
             else:
-                ray_feats, transmittance = spc_render.exponential_integration(
-                    feats.view(-1, num_channels), tau, boundary, exclusive=True
-                )
-                composited_feats = alpha * ray_feats
+                ray_feats = spc_render.sum_reduce(feats.view(-1, num_channels) * transmittance, boundary)
             out_feats = torch.zeros(N, num_channels, device=feats.device)
-            out_feats[ridx_hit] = composited_feats
+            out_feats[ridx_hit] = ray_feats
             extra_outputs[channel] = out_feats
 
-        opacity = 1 - torch.exp(-tau)
-        opacity_sum = spc_render.sum_reduce(opacity, boundary)
-        opacity_xlogx_sum = spc_render.sum_reduce(opacity * torch.log(opacity + 1e-10), boundary)
-        entropy_ray = -opacity_xlogx_sum / (opacity_sum + 1e-10) + torch.log(opacity_sum + 1e-10)
-        mask = (opacity_sum > 0.01).detach()
-        entropy_ray *= mask
-        out_entropy = torch.zeros(N, 1, device=entropy_ray.device)
-        out_entropy[ridx_hit] = entropy_ray
+        out_entropy = None
+        if compute_entropy:
+            opacity = 1 - torch.exp(-tau)
+            opacity_sum = spc_render.sum_reduce(opacity, boundary)
+            opacity_xlogx_sum = spc_render.sum_reduce(opacity * torch.log(opacity + 1e-10), boundary)
+            entropy_ray = -opacity_xlogx_sum / (opacity_sum + 1e-10) + torch.log(opacity_sum + 1e-10)
+            mask = (opacity_sum > entropy_threshold).detach()
+            entropy_ray *= mask
+            out_entropy = torch.zeros(N, 1, device=entropy_ray.device)
+            out_entropy[ridx_hit] = entropy_ray
 
         return RenderBuffer(depth=depth, hit=hit, rgb=rgb, alpha=out_alpha,
                             entropy=out_entropy,
