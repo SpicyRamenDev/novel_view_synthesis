@@ -72,7 +72,7 @@ class MyNeuralRadianceField(BaseNeuralField):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.bottleneck_dim = bottleneck_dim
-        self.decoder_spatial, self.decoder_directional, self.decoder_background = \
+        self.decoder_spatial, self.decoder_normal, self.decoder_directional, self.decoder_background = \
             self.init_decoders(activation_type, layer_type, num_layers, hidden_dim, bottleneck_dim)
         self.density_activation = torch.nn.Softplus()
 
@@ -113,6 +113,15 @@ class MyNeuralRadianceField(BaseNeuralField):
                                        hidden_dim=hidden_dim,
                                        skip=[])
 
+        decoder_normal = BasicDecoder(input_dim=self.spatial_net_input_dim,
+                                      output_dim=3,
+                                      activation=get_activation_class(activation_type),
+                                      bias=True,
+                                      layer=get_layer_class(layer_type),
+                                      num_layers=num_layers,
+                                      hidden_dim=hidden_dim,
+                                      skip=[])
+
         decoder_directional = BasicDecoder(input_dim=self.directional_net_input_dim,
                                            output_dim=3,
                                            activation=get_activation_class(activation_type),
@@ -131,7 +140,7 @@ class MyNeuralRadianceField(BaseNeuralField):
                                           hidden_dim=16,
                                           skip=[])
 
-        return decoder_spatial, decoder_directional, decoder_background
+        return decoder_spatial, decoder_normal, decoder_directional, decoder_background
 
     def prune(self):
         """Prunes the blas based on current state.
@@ -178,9 +187,9 @@ class MyNeuralRadianceField(BaseNeuralField):
 
     def density_blob(self, coords, scale, width):
         d2 = (coords ** 2).sum(axis=-1, keepdim=True)
-        density = scale * torch.exp(- d2 / (width ** 2))
-        # d = torch.sqrt(d2)
-        # density = scale * (1 - d / width)
+        # density = scale * torch.exp(- d2 / (width ** 2))
+        d = torch.sqrt(d2)
+        density = scale * (1 - d / width)
         return density
 
     def density(self, coords, lod_idx=None):
@@ -212,8 +221,7 @@ class MyNeuralRadianceField(BaseNeuralField):
 
     def features(self, coords, ray_d, lod_idx=None, channels=[],
                  ambient_ratio=0.1, shading='lambertian', light=None,
-                 use_light=True, phase='coarse',
-                 **kwargs):
+                 use_light=True, phase='coarse'):
         """Compute color and density [particles / vol] for the provided coordinates.
 
         Args:
@@ -244,15 +252,16 @@ class MyNeuralRadianceField(BaseNeuralField):
         # Density is [particles / meter], so need to be multiplied by distance
         # density ~ (batch, 1)
         density_feats = spatial_feats[..., 0:1]
-        albedo_color = spatial_feats[..., 1:4]
-        normal_pred_raw = spatial_feats[..., 4:7]
+        albedo_color_feats = spatial_feats[..., 1:4]
+        normal_pred_feats = spatial_feats[..., 4:7]
+        # normal_pred_feats = self.decoder_normal(feats)[..., 0:3]
         bottleneck = None #spatial_feats[..., 7:]
 
         if self.use_blob:
             density_feats += self.density_blob(coords, self.blob_scale, self.blob_width)
         density = self.density_activation(density_feats)
-        albedo_color = torch.sigmoid(albedo_color)
-        normal_pred = l2_normalize(normal_pred_raw)
+        albedo_color = torch.sigmoid(albedo_color_feats)
+        normal_pred = l2_normalize(normal_pred_feats)
         normal_pred = torch.nan_to_num(normal_pred)
 
         normal = None
@@ -284,10 +293,11 @@ class MyNeuralRadianceField(BaseNeuralField):
             if light is None:
                 light = 2 * torch.tensor([1., 1., 1.], device=self.device)
             if shading == 'textureless':
-                # albedo_color = torch.ones_like(albedo_color)
-                albedo_color = albedo_color.detach()
-            light_dir = l2_normalize(light - coords)
-            light_diffuse = (normal_pred * light_dir).sum(axis=-1, keepdim=True).clamp(min=0)
+                albedo_color = torch.ones_like(albedo_color)
+                # albedo_color = albedo_color.detach()
+            # light_dir = -l2_normalize(light - coords)
+            light_dir = -l2_normalize(light)
+            light_diffuse = (-normal_pred * light_dir).sum(axis=-1, keepdim=True).clamp(min=0)
             colors = albedo_color * ((1 - ambient_ratio) * light_diffuse + ambient_ratio)
         else:
             ref_ray_d = reflect(ray_d, normal_pred)

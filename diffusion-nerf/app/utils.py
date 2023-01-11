@@ -25,9 +25,11 @@ def sample(value_range=(0, 1)):
 
 
 def spherical_to_cartesian(azimuth, polar, distance=1.0):
-    x = distance * torch.sin(polar) * torch.sin(azimuth)
+    azimuth = azimuth * torch.pi / 180.0
+    polar = polar * torch.pi / 180.0
+    x = distance * torch.sin(polar) * torch.cos(azimuth)
     y = distance * torch.cos(polar)
-    z = distance * torch.sin(polar) * torch.cos(azimuth)
+    z = -distance * torch.sin(polar) * torch.sin(azimuth)
     return torch.tensor([x, y, z])
 
 
@@ -37,13 +39,15 @@ def get_rotation_matrix(azimuth, polar):
     cos_azimuth, cos_polar = torch.cos(azimuth), torch.cos(polar)
     sin_azimuth, sin_polar = torch.sin(azimuth), torch.sin(polar)
     return torch.tensor([
-        [cos_azimuth * cos_polar, -sin_azimuth, cos_azimuth * sin_polar],
-        [sin_azimuth * cos_polar, cos_azimuth, sin_azimuth * sin_polar],
-        [-sin_polar, 0, cos_polar]
+        [cos_polar * cos_azimuth, sin_polar * cos_azimuth, sin_azimuth],
+        [-sin_polar, cos_polar, 0.0],
+        [-cos_polar * sin_azimuth, -sin_polar * sin_azimuth, cos_azimuth]
     ])
 
 
-def sample_polar(polar_range=(0, 100)):
+def sample_polar(polar_range=(0, 100), uniform=True):
+    if not uniform:
+        return sample(polar_range)
     max_polar = min(polar_range[1] * torch.pi / 180.0, torch.pi - torch.finfo(torch.float32).eps)
     min_polar = max(polar_range[0] * torch.pi / 180.0, torch.finfo(torch.float32).eps)
     cos_max, cos_min = torch.cos(torch.tensor([min_polar, max_polar]))
@@ -51,11 +55,11 @@ def sample_polar(polar_range=(0, 100)):
     return polar
 
 
-def sample_spherical_uniform(azimuth_range=(0, 360), polar_range=(-10, 90)):
+def sample_spherical_uniform(azimuth_range=(0, 360), polar_range=(0, 100)):
     azimuth = sample(azimuth_range)
     polar = sample_polar(polar_range)
 
-    coords = spherical_to_cartesian(azimuth * torch.pi / 180.0, polar * torch.pi / 180.0)
+    coords = spherical_to_cartesian(azimuth, polar)
     return coords, azimuth, polar
 
 

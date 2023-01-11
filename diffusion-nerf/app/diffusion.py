@@ -45,9 +45,10 @@ class Diffusion(nn.Module):
              weight_type='constant'):
         detached_image = image.detach()
         detached_image.requires_grad = True
+        start_image = detached_image
         if self.transform is not None:
-            latent = self.transform(detached_image)
-        latent = self.process_image(latent)
+            start_image = self.transform(start_image)
+        latent = self.process_image(start_image)
 
         min_step = int(self.num_train_timesteps * min_ratio)
         max_step = int(self.num_train_timesteps * max_ratio)
@@ -57,8 +58,8 @@ class Diffusion(nn.Module):
             noisy_latent = self.scheduler.add_noise(latent, noise, t)
             noisy_latents = torch.cat([noisy_latent] * 2)
             noise_preds = self.unet(noisy_latents, t, encoder_hidden_states=text_embeddings).sample
-        noise_pred_uncond, noise_pred_text = noise_preds
-        noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        noise_pred_uncond, noise_pred_text = noise_preds.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
         if weight_type == 'linear':
             w = (1 - self.scheduler.alphas_cumprod[t])
@@ -72,5 +73,6 @@ class Diffusion(nn.Module):
         latent.backward(gradient=grad)
 
         image_grad = detached_image.grad
+        image_grad = image_grad / (start_image.shape[-1] * start_image.shape[-2])
 
         return image_grad

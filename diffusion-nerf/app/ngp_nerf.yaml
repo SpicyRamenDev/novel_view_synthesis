@@ -11,7 +11,7 @@ global:
 
 optimizer:
     optimizer_type: 'adam'
-    lr: 0.001
+    lr: 0.00003
     rgb_loss: 1.0
 
 dataset:
@@ -19,7 +19,7 @@ dataset:
     multiview_dataset_format: 'standard'
     num_rays_sampled_per_img: 4096
     mip: 2
-    bg_color: 'white'
+    bg_color: 'decoder'
 
 renderer:
     tracer_type: 'MyPackedRFTracer'
@@ -71,43 +71,46 @@ my_nef:
     pos_embedder: 'positional'
     view_embedder: 'spherical'
     use_blob: True
-    blob_scale: 5.0
-    blob_width: 0.3
+    blob_scale: 10.0
+    blob_width: 0.5
     bottleneck_dim: 8
 
 my_optimizer:
-    orientation_loss: 0.05
-    predicted_normal_loss: 0.1 # 0.05
+    orientation_loss: 0.01
+    predicted_normal_loss: 0.003
     opacity_loss: 0.002
-    entropy_loss: 0.002
+    entropy_loss: 0.0
     albedo_steps: 1000
     diffusion_loss: 1.0
-    warmup_iterations: 0
+    warmup_iterations: 0  # 3000
     init_lr: 0.1
-    end_lr: 0.5
+    end_lr: 0.1
     reg_warmup_iterations: 0 #1000
     reg_init_lr: 0.1
     coarse_ratio: 0.5
+    warmup_ratio: 0.1
+    update_every: 1
 
 my_diffusion:
     repo_id: 'stabilityai/stable-diffusion-2-1-base'
     diffusion_type: 'StableDiffusion'
     prompt: 'a 3D render of a birthday cake with candles'
-    negative_prompt: ''
+    negative_prompt: '' #blurry, poorly rendered, oversaturated, deformed, low resolution, lowres, cropped, worst quality, artifacts, ugly, bad proportions'
     guidance_scale: 100
     diffusion_bg_color: 'noise'
 
 my_camera:
     num_novel_views_per_gt: 0
     num_novel_views_base: 100
+    warmup_resolution: 64
     coarse_resolution: 64
     fine_resolution: 256
     light_distance_range:
         - 1.0 # 0.8
         - 1.5 # 1.5
     camera_distance_range:
-        - 1.1 # 1.0
-        - 1.5 # 1.5
+        - 3.0 # 1.0
+        - 6.0 # 1.5
     azimuth_range:
         - 0
         - 360
@@ -118,8 +121,8 @@ my_camera:
         - 25
         - 42
     focal_length_multiplier_range:
-        - 1.0 # 0.7
-        - 2.0 # 1.35
+        - 0.85 # 1.0 # 0.7
+        - 2.8 # 2.0 # 1.35
     camera_offset: 0.1
     camera_up_std: 0.02
-    look_at_std: 0.1
+    look_at_std: 0.1 # 0.1

@@ -70,7 +70,7 @@ class MyPackedRFTracer(BaseTracer):
               lod_idx=None, raymarch_type='voxel', num_steps=64, step_size=1.0, bg_color='white',
               stop_grad_channels=[], entropy_threshold=0.01, bg_color_value=None,
               compute_entropy=False,
-              **kwargs):
+              nef_parameters=dict()):
         """Trace the rays against the neural field.
 
         Args:
@@ -102,8 +102,6 @@ class MyPackedRFTracer(BaseTracer):
         else:
             depth = None
 
-        if 'background' in channels:
-            bg_color = 'decoder'
         if bg_color == 'white':
             rgb = torch.ones(N, 3, device=rays.origins.device)
         elif bg_color == 'noise':
@@ -134,7 +132,8 @@ class MyPackedRFTracer(BaseTracer):
 
         # Compute the color and density for each ray and their samples
         queried_channels = {"rgb", "density"}.union(extra_channels)
-        queried_features = nef.features(coords=samples, ray_d=hit_ray_d, lod_idx=lod_idx, channels=queried_channels)
+        queried_features = nef.features(coords=samples, ray_d=hit_ray_d, lod_idx=lod_idx, channels=queried_channels,
+                                        **nef_parameters)
         color = queried_features["rgb"]
         density = queried_features["density"]
         density = density.reshape(-1, 1)  # Protect against squeezed return shape
